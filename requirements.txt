@@ -1,1 +1,2 @@
 vkbottle
+python-dotenv
