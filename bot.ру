@@ -49,12 +49,21 @@ def get_target_id(message: Message):
     match_num = re.findall(r'\d+', message.text)
     if match_num: return int(match_num[0])
     return None
-
 # ==========================================
 # 3. ФОНОВЫЕ ПРОВЕРКИ
 # ==========================================
 @bot.on.chat_message()
 async def background_handler(message: Message):
+    # ЗАЩИТА ВЛАДЕЛЬЦА: Если пишет Владелец, мы пропускаем все баны и муты
+    if message.from_id == ADMIN_ID:
+        if message.text and message.text.startswith('/'): return
+        try:
+            cur.execute("INSERT INTO messages (peer_id, user_id, count) VALUES (?, ?, 1) ON CONFLICT(peer_id, user_id) DO UPDATE SET count = count + 1", (message.peer_id, message.from_id))
+            conn.commit()
+        except: pass
+        return
+
+    # Проверка на ГЛОБАЛЬНЫЙ БАН
     cur.execute("SELECT user_id FROM sysbans WHERE user_id=?", (message.from_id,))
     if cur.fetchone():
         try:
@@ -63,12 +72,14 @@ async def background_handler(message: Message):
         except: pass
         return
 
+    # Проверка на ЛОКАЛЬНЫЙ БАН
     cur.execute("SELECT user_id FROM bans WHERE peer_id=? AND user_id=?", (message.peer_id, message.from_id))
     if cur.fetchone():
         try: await bot.api.messages.remove_chat_user(chat_id=message.chat_id, user_id=message.from_id)
         except: pass
         return
 
+    # Проверка на МУТ
     cur.execute("SELECT expire FROM mutes WHERE peer_id=? AND user_id=?", (message.peer_id, message.from_id))
     mute = cur.fetchone()
     if mute:
@@ -80,12 +91,12 @@ async def background_handler(message: Message):
             cur.execute("DELETE FROM mutes WHERE peer_id=? AND user_id=?", (message.peer_id, message.from_id))
             conn.commit()
 
+    # Счетчик
     if message.text and message.text.startswith('/'): return
     try:
         cur.execute("INSERT INTO messages (peer_id, user_id, count) VALUES (?, ?, 1) ON CONFLICT(peer_id, user_id) DO UPDATE SET count = count + 1", (message.peer_id, message.from_id))
         conn.commit()
     except: pass
-
 # ==========================================
 # 4. КОМАНДЫ
 # ==========================================
