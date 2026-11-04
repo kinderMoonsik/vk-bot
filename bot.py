@@ -3,7 +3,7 @@ import re
 import time
 import random
 import os
-from vkbottle.bot import Bot, Message
+from vkbottle.bot import Bot, Message, MessageEvent
 from vkbottle import Keyboard, KeyboardButtonColor, Callback
 
 # ==========================================
@@ -31,6 +31,8 @@ cur.execute('''CREATE TABLE IF NOT EXISTS mutes (peer_id INTEGER, user_id INTEGE
 cur.execute('''CREATE TABLE IF NOT EXISTS bans (peer_id INTEGER, user_id INTEGER, PRIMARY KEY (peer_id, user_id))''')
 cur.execute('''CREATE TABLE IF NOT EXISTS warns (peer_id INTEGER, user_id INTEGER, count INTEGER DEFAULT 0, PRIMARY KEY (peer_id, user_id))''')
 cur.execute('''CREATE TABLE IF NOT EXISTS sysbans (user_id INTEGER PRIMARY KEY)''')
+cur.execute('''CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY AUTOINCREMENT, peer_id INTEGER, user_id INTEGER, text TEXT, status TEXT)''')
+cur.execute('''CREATE TABLE IF NOT EXISTS nicknames (peer_id INTEGER, user_id INTEGER, nick TEXT, PRIMARY KEY (peer_id, user_id))''')
 conn.commit()
 
 def get_user_rank(peer_id, user_id):
@@ -127,7 +129,12 @@ async def stats(message: Message):
     cur.execute("SELECT count FROM warns WHERE peer_id=? AND user_id=?", (message.peer_id, target_id))
     warns = cur.fetchone()
     warns = warns[0] if warns else 0
-    await message.answer(f"📊 Статистика [id{target_id}|пользователя]:\nСообщений: {count}\nРанг: {rank} ({RANKS.get(rank)})\nВарны: {warns}/3")
+    
+    cur.execute("SELECT nick FROM nicknames WHERE peer_id=? AND user_id=?", (message.peer_id, target_id))
+    nick_res = cur.fetchone()
+    display_name = nick_res[0] if nick_res else f"[id{target_id}|пользователя]"
+    
+    await message.answer(f"📊 Статистика {display_name}:\nСообщений: {count}\nРанг: {rank} ({RANKS.get(rank)})\nВарны: {warns}/3")
 
 @bot.on.chat_message(text="/setrank")
 async def set_rank(message: Message):
@@ -295,8 +302,135 @@ async def zov_broadcast(message: Message, text: str):
     await message.answer(f"📢 Рассылка завершена.\nОтправлено: {sent}\nОшибок: {errors}")
 
 # ==========================================
+# 5. СИСТЕМА ЖАЛОБ (ТИКЕТОВ) /report
+# ==========================================
+@bot.on.chat_message(text="/report <text>")
+async def create_ticket(message: Message, text: str):
+    if not text:
+        return await message.answer("Использование: /report [текст]")
+
+    cur.execute("INSERT INTO tickets (peer_id, user_id, text, status) VALUES (?, ?, ?, 'open')", 
+                (message.peer_id, message.from_id, text))
+    conn.commit()
+    ticket_id = cur.lastrowid
+
+    await message.answer(
+        f"Тикет #{ticket_id} успешно создан. Ваше обращение передано администраторам.\n"
+        f"Ответ на ваш тикет придёт в эту беседу как только администраторы ответят на него."
+    )
+
+    try:
+        await bot.api.messages.send(
+            peer_id=ADMIN_ID,
+            message=f"🔔 Новый тикет #{ticket_id} в чате {message.peer_id}\n"
+                    f"От: [id{message.from_id}|Пользователь]\n"
+                    f"Текст: {text}\n\n"
+                    f"Чтобы ответить, напиши: /answer {ticket_id} [текст]",
+            random_id=0
+        )
+    except:
+        pass
+
+@bot.on.chat_message(text="/answer <ticket_id> <text>")
+async def answer_ticket(message: Message, ticket_id: int, text: str):
+    if get_user_rank(message.peer_id, message.from_id) < 2:
+        return await message.answer("Отвечать на тикеты может только Администратор (2)+.")
+
+    cur.execute("SELECT peer_id, user_id, status FROM tickets WHERE id=?", (ticket_id,))
+    ticket = cur.fetchone()
+
+    if not ticket:
+        return await message.answer("Тикет не найден.")
+    
+    peer_id, user_id, status = ticket
+
+    if status == 'closed':
+        return await message.answer("Этот тикет уже закрыт.")
+
+    try:
+        await bot.api.messages.send(
+            peer_id=peer_id,
+            message=f"Ваш тикет #{ticket_id} был обновлен.\n\n"
+                    f"Сообщение Администратора [id{message.from_id}|]:\n{text}\n\n"
+                    f"Ваш тикет всё ещё открыт. Если вы хотите отправить сообщение — используйте /report",
+            random_id=0
+        )
+        await message.answer(f"Ответ отправлен в беседу {peer_id}.")
+    except Exception as e:
+        await message.answer(f"Не удалось отправить ответ: {e}")
+
+@bot.on.chat_message(text="/close <ticket_id>")
+async def close_ticket(message: Message, ticket_id: int):
+    if get_user_rank(message.peer_id, message.from_id) < 2:
+        return await message.answer("Закрывать тикеты может только Администратор (2)+.")
+
+    cur.execute("SELECT peer_id, user_id FROM tickets WHERE id=? AND status='open'", (ticket_id,))
+    ticket = cur.fetchone()
+
+    if not ticket:
+        return await message.answer("Открытый тикет не найден.")
+
+    peer_id, user_id = ticket
+    cur.execute("UPDATE tickets SET status='closed' WHERE id=?", (ticket_id,))
+    conn.commit()
+
+    kb = (
+        Keyboard(inline=True)
+        .add(Callback("1", {"cmd": "rate", "ticket_id": ticket_id, "score": 1}), color=KeyboardButtonColor.PRIMARY)
+        .add(Callback("2", {"cmd": "rate", "ticket_id": ticket_id, "score": 2}), color=KeyboardButtonColor.PRIMARY)
+        .add(Callback("3", {"cmd": "rate", "ticket_id": ticket_id, "score": 3}), color=KeyboardButtonColor.PRIMARY)
+        .add(Callback("4", {"cmd": "rate", "ticket_id": ticket_id, "score": 4}), color=KeyboardButtonColor.PRIMARY)
+        .add(Callback("5", {"cmd": "rate", "ticket_id": ticket_id, "score": 5}), color=KeyboardButtonColor.PRIMARY)
+    ).get_json()
+
+    await bot.api.messages.send(
+        peer_id=peer_id,
+        message=f"Ваш тикет #{ticket_id} был закрыт Администратором.\n\n"
+                f"Если у вас остались вопросы — откройте новый тикет командой '/report'.\n\n"
+                f"Оцените ответ администратора от 1 до 5.",
+        keyboard=kb,
+        random_id=0
+    )
+    await message.answer(f"Тикет #{ticket_id} закрыт.")
+
+@bot.on.message_event()
+async def rate_ticket_handler(event: MessageEvent):
+    if event.payload.get("cmd") == "rate":
+        ticket_id = event.payload.get("ticket_id")
+        score = event.payload.get("score")
+        await event.answer(f"Спасибо! Вы оценили тикет #{ticket_id} на {score}/5.", show_snackbar=True)
+
+# ==========================================
+# 6. СИСТЕМА НИКОВ (Только ЗГА (4) и выше)
+# ==========================================
+@bot.on.chat_message(text="/nick <name>")
+async def set_nick(message: Message, name: str):
+    # Проверка ранга (только 4 и выше)
+    if get_user_rank(message.peer_id, message.from_id) < 4:
+        return await message.answer("Менять ник может только ЗГА (4) и выше.")
+        
+    if len(name) > 20:
+        return await message.answer("Ник слишком длинный. Максимум 20 символов.")
+    
+    cur.execute("INSERT OR REPLACE INTO nicknames (peer_id, user_id, nick) VALUES (?, ?, ?)", 
+                (message.peer_id, message.from_id, name))
+    conn.commit()
+    await message.answer(f"✅ Твой ник в этой беседе изменён на: {name}")
+
+@bot.on.chat_message(text="/rnick")
+async def del_nick(message: Message):
+    # Проверка ранга (только 4 и выше)
+    if get_user_rank(message.peer_id, message.from_id) < 4:
+        return await message.answer("Удалять ник может только ЗГА (4) и выше.")
+
+    cur.execute("DELETE FROM nicknames WHERE peer_id=? AND user_id=?", (message.peer_id, message.from_id))
+    conn.commit()
+    await message.answer("🗑 Твой ник удалён. Теперь я буду звать тебя по имени из профиля ВК.")
+
+# ==========================================
 # ЗАПУСК
 # ==========================================
 if __name__ == "__main__":
-    print("Бот запущен! Иерархия 9 рангов активна.")
+    print("Бот запущен! Иерархия 9 рангов, Тикет-система и Ники (4+) активны.")
     bot.run_forever()
+   
