@@ -302,8 +302,10 @@ async def zov_broadcast(message: Message, text: str):
     await message.answer(f"📢 Рассылка завершена.\nОтправлено: {sent}\nОшибок: {errors}")
 
 # ==========================================
-# 5. СИСТЕМА ЖАЛОБ (ТИКЕТОВ) /report
+# 5. СИСТЕМА ЖАЛОБ (Создают все, отвечают ЗГА+)
 # ==========================================
+
+# Создание тикета (Доступно всем пользователям)
 @bot.on.chat_message(text="/report <text>")
 async def create_ticket(message: Message, text: str):
     if not text:
@@ -314,104 +316,134 @@ async def create_ticket(message: Message, text: str):
     conn.commit()
     ticket_id = cur.lastrowid
 
-    await message.answer(
-        f"Тикет #{ticket_id} успешно создан. Ваше обращение передано администраторам.\n"
-        f"Ответ на ваш тикет придёт в эту беседу как только администраторы ответят на него."
-    )
+    await message.answer(f"Тикет #{ticket_id} создан. Ожидайте ответа руководства.")
 
-    try:
+    # Ищем всех, у кого ранг 4+ в этой беседе (ЗГА, Главный админ и т.д.)
+    cur.execute("SELECT user_id FROM roles WHERE peer_id=? AND rank >= 4", (message.peer_id,))
+    admins = [row[0] for row in cur.fetchall()]
+    
+    if ADMIN_ID not in admins:
+        admins.append(ADMIN_ID)
+
+    # Отправляем уведомления админам в ЛС
+    for admin_id in admins:
+        try:
+            kb = (
+                Keyboard(inline=True)
+                .add(Callback("✍️ Ответить", {"cmd": "ticket_reply", "ticket_id": ticket_id}), color=KeyboardButtonColor.PRIMARY)
+                .add(Callback("🔒 Закрыть", {"cmd": "ticket_close", "ticket_id": ticket_id}), color=KeyboardButtonColor.NEGATIVE)
+            ).get_json()
+
+            await bot.api.messages.send(
+                peer_id=admin_id,
+                message=f"🔔 **Новый тикет #{ticket_id}**\n"
+                        f"Чат: {message.peer_id}\n"
+                        f"От: [id{message.from_id}|Пользователь]\n\n"
+                        f"Текст: {text}",
+                keyboard=kb,
+                random_id=0
+            )
+        except Exception:
+            pass
+
+# Обработка кнопок в ЛС (Только ЗГА+)
+@bot.on.raw_event("message_event")
+async def ticket_admin_handler(event: dict):
+    payload = event.get("object", {}).get("payload", {})
+    if payload.get("cmd") not in ["ticket_reply", "ticket_close"]:
+        return
+
+    event_id = event.get("object", {}).get("event_id")
+    user_id = event.get("object", {}).get("user_id")
+    peer_id = event.get("object", {}).get("peer_id")
+    
+    ticket_id = payload.get("ticket_id")
+    cur.execute("SELECT peer_id, user_id, status FROM tickets WHERE id=?", (ticket_id,))
+    ticket = cur.fetchone()
+
+    if not ticket or ticket[2] == 'closed':
+        return await bot.api.messages.send_message_event_answer(
+            event_id=event_id, user_id=user_id, peer_id=peer_id,
+            event_data={"type": "show_snackbar", "text": "Тикет не найден или уже закрыт"}
+        )
+
+    target_peer, target_user, status = ticket
+
+    # Проверка ранга (ЗГА 4+)
+    my_rank = get_user_rank(target_peer, user_id)
+    if my_rank < 4 and user_id != ADMIN_ID:
+        return await bot.api.messages.send_message_event_answer(
+            event_id=event_id, user_id=user_id, peer_id=peer_id,
+            event_data={"type": "show_snackbar", "text": "У вас нет прав (нужен ЗГА+)"}
+        )
+
+    if payload.get("cmd") == "ticket_close":
+        cur.execute("UPDATE tickets SET status='closed' WHERE id=?", (ticket_id,))
+        conn.commit()
+
+        # Кнопки оценки для пользователя
+        kb = (
+            Keyboard(inline=True)
+            .add(Callback("1", {"cmd": "rate", "ticket_id": ticket_id, "score": 1}), color=KeyboardButtonColor.PRIMARY)
+            .add(Callback("2", {"cmd": "rate", "ticket_id": ticket_id, "score": 2}), color=KeyboardButtonColor.PRIMARY)
+            .add(Callback("3", {"cmd": "rate", "ticket_id": ticket_id, "score": 3}), color=KeyboardButtonColor.PRIMARY)
+            .add(Callback("4", {"cmd": "rate", "ticket_id": ticket_id, "score": 4}), color=KeyboardButtonColor.PRIMARY)
+            .add(Callback("5", {"cmd": "rate", "ticket_id": ticket_id, "score": 5}), color=KeyboardButtonColor.PRIMARY)
+        ).get_json()
+
         await bot.api.messages.send(
-            peer_id=ADMIN_ID,
-            message=f"🔔 Новый тикет #{ticket_id} в чате {message.peer_id}\n"
-                    f"От: [id{message.from_id}|Пользователь]\n"
-                    f"Текст: {text}\n\n"
-                    f"Чтобы ответить, напиши: /answer {ticket_id} [текст]",
+            peer_id=target_peer,
+            message=f"Тикет #{ticket_id} закрыт руководством.\nОцените нашу работу от 1 до 5:",
+            keyboard=kb,
             random_id=0
         )
-    except:
-        pass
+        
+        await bot.api.messages.send_message_event_answer(
+            event_id=event_id, user_id=user_id, peer_id=peer_id,
+            event_data={"type": "show_snackbar", "text": "Тикет закрыт"}
+        )
 
-@bot.on.chat_message(text="/answer <ticket_id> <text>")
+    elif payload.get("cmd") == "ticket_reply":
+        await bot.api.messages.send_message_event_answer(
+            event_id=event_id, user_id=user_id, peer_id=peer_id,
+            event_data={"type": "show_snackbar", "text": "Напиши текст ответа в этот чат"}
+        )
+        await bot.api.messages.send(
+            peer_id=peer_id, 
+            message=f"Чтобы ответить на тикет #{ticket_id}, напиши сюда:\n/answer {ticket_id} [твой текст]",
+            random_id=0
+        )
+
+# Ответ на тикет (Только ЗГА+)
+@bot.on.message(text="/answer <ticket_id> <text>")
 async def answer_ticket(message: Message, ticket_id: int, text: str):
-    if get_user_rank(message.peer_id, message.from_id) < 2:
-        return await message.answer("Отвечать на тикеты может только Администратор (2)+.")
-
     cur.execute("SELECT peer_id, user_id, status FROM tickets WHERE id=?", (ticket_id,))
     ticket = cur.fetchone()
 
     if not ticket:
         return await message.answer("Тикет не найден.")
     
-    peer_id, user_id, status = ticket
+    target_peer, target_user, status = ticket
 
     if status == 'closed':
         return await message.answer("Этот тикет уже закрыт.")
 
+    # Проверка ранга отвечающего
+    my_rank = get_user_rank(target_peer, message.from_id)
+    if my_rank < 4 and message.from_id != ADMIN_ID:
+        return await message.answer("Отвечать на тикеты может только ЗГА (4)+.")
+
     try:
         await bot.api.messages.send(
-            peer_id=peer_id,
-            message=f"Ваш тикет #{ticket_id} был обновлен.\n\n"
-                    f"Сообщение Администратора [id{message.from_id}|]:\n{text}\n\n"
-                    f"Ваш тикет всё ещё открыт. Если вы хотите отправить сообщение — используйте /report",
+            peer_id=target_peer,
+            message=f"💬 **Ответ по тикету #{ticket_id}**\n\n"
+                    f"{text}\n\n"
+                    f"Ваш тикет всё ещё открыт. Если у вас есть дополнения, напишите /report",
             random_id=0
         )
-        await message.answer(f"Ответ отправлен в беседу {peer_id}.")
+        await message.answer(f"✅ Ответ отправлен в беседу {target_peer}.")
     except Exception as e:
         await message.answer(f"Не удалось отправить ответ: {e}")
-
-@bot.on.chat_message(text="/close <ticket_id>")
-async def close_ticket(message: Message, ticket_id: int):
-    if get_user_rank(message.peer_id, message.from_id) < 2:
-        return await message.answer("Закрывать тикеты может только Администратор (2)+.")
-
-    cur.execute("SELECT peer_id, user_id FROM tickets WHERE id=? AND status='open'", (ticket_id,))
-    ticket = cur.fetchone()
-
-    if not ticket:
-        return await message.answer("Открытый тикет не найден.")
-
-    peer_id, user_id = ticket
-    cur.execute("UPDATE tickets SET status='closed' WHERE id=?", (ticket_id,))
-    conn.commit()
-
-    kb = (
-        Keyboard(inline=True)
-        .add(Callback("1", {"cmd": "rate", "ticket_id": ticket_id, "score": 1}), color=KeyboardButtonColor.PRIMARY)
-        .add(Callback("2", {"cmd": "rate", "ticket_id": ticket_id, "score": 2}), color=KeyboardButtonColor.PRIMARY)
-        .add(Callback("3", {"cmd": "rate", "ticket_id": ticket_id, "score": 3}), color=KeyboardButtonColor.PRIMARY)
-        .add(Callback("4", {"cmd": "rate", "ticket_id": ticket_id, "score": 4}), color=KeyboardButtonColor.PRIMARY)
-        .add(Callback("5", {"cmd": "rate", "ticket_id": ticket_id, "score": 5}), color=KeyboardButtonColor.PRIMARY)
-    ).get_json()
-
-    await bot.api.messages.send(
-        peer_id=peer_id,
-        message=f"Ваш тикет #{ticket_id} был закрыт Администратором.\n\n"
-                f"Если у вас остались вопросы — откройте новый тикет командой '/report'.\n\n"
-                f"Оцените ответ администратора от 1 до 5.",
-        keyboard=kb,
-        random_id=0
-    )
-    await message.answer(f"Тикет #{ticket_id} закрыт.")
-
-@bot.on.raw_event("message_event")
-async def rate_ticket_handler(event: dict):
-    payload = event.get("object", {}).get("payload", {})
-    if payload.get("cmd") == "rate":
-        ticket_id = payload.get("ticket_id")
-        score = payload.get("score")
-        event_id = event.get("object", {}).get("event_id")
-        user_id = event.get("object", {}).get("user_id")
-        peer_id = event.get("object", {}).get("peer_id")
-        
-        try:
-            await bot.api.messages.send_message_event_answer(
-                event_id=event_id,
-                user_id=user_id,
-                peer_id=peer_id,
-                event_data={"type": "show_snackbar", "text": f"Спасибо! Оценка: {score}/5"}
-            )
-        except Exception as e:
-            print(f"Ошибка при отправке коллбэка: {e}")
 
 # ==========================================
 # 6. СИСТЕМА НИКОВ (Только ЗГА (4) и выше)
