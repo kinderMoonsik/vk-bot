@@ -278,8 +278,8 @@ async def unsysban_user(message: Message):
 
 @bot.on.chat_message(text="/zov <text>")
 async def zov_broadcast(message: Message, text: str):
-    if get_user_rank(message.peer_id, message.from_id) < 8: 
-    return await message.answer("Рассылка доступна только с ранга Заместителя Владельца (8)+.")
+if get_user_rank(message.peer_id, message.from_id) < 8: 
+        return await message.answer("Рассылка доступна только с ранга Заместителя Владельца (8)+.")
     try: 
         conversations = await bot.api.messages.get_conversations(peer_types=["chat"], count=200)
     except Exception as e: 
