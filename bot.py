@@ -3,7 +3,7 @@ import re
 import time
 import random
 import os
-from vkbottle.bot import Bot, Message, MessageEvent
+from vkbottle.bot import Bot, Message
 from vkbottle import Keyboard, KeyboardButtonColor, Callback
 
 # ==========================================
@@ -393,19 +393,31 @@ async def close_ticket(message: Message, ticket_id: int):
     )
     await message.answer(f"Тикет #{ticket_id} закрыт.")
 
-@bot.on.message_event()
-async def rate_ticket_handler(event: MessageEvent):
-    if event.payload.get("cmd") == "rate":
-        ticket_id = event.payload.get("ticket_id")
-        score = event.payload.get("score")
-        await event.answer(f"Спасибо! Вы оценили тикет #{ticket_id} на {score}/5.", show_snackbar=True)
+@bot.on.raw_event("message_event")
+async def rate_ticket_handler(event: dict):
+    payload = event.get("object", {}).get("payload", {})
+    if payload.get("cmd") == "rate":
+        ticket_id = payload.get("ticket_id")
+        score = payload.get("score")
+        event_id = event.get("object", {}).get("event_id")
+        user_id = event.get("object", {}).get("user_id")
+        peer_id = event.get("object", {}).get("peer_id")
+        
+        try:
+            await bot.api.messages.send_message_event_answer(
+                event_id=event_id,
+                user_id=user_id,
+                peer_id=peer_id,
+                event_data={"type": "show_snackbar", "text": f"Спасибо! Оценка: {score}/5"}
+            )
+        except Exception as e:
+            print(f"Ошибка при отправке коллбэка: {e}")
 
 # ==========================================
 # 6. СИСТЕМА НИКОВ (Только ЗГА (4) и выше)
 # ==========================================
 @bot.on.chat_message(text="/nick <name>")
 async def set_nick(message: Message, name: str):
-    # Проверка ранга (только 4 и выше)
     if get_user_rank(message.peer_id, message.from_id) < 4:
         return await message.answer("Менять ник может только ЗГА (4) и выше.")
         
@@ -419,7 +431,6 @@ async def set_nick(message: Message, name: str):
 
 @bot.on.chat_message(text="/rnick")
 async def del_nick(message: Message):
-    # Проверка ранга (только 4 и выше)
     if get_user_rank(message.peer_id, message.from_id) < 4:
         return await message.answer("Удалять ник может только ЗГА (4) и выше.")
 
@@ -433,4 +444,3 @@ async def del_nick(message: Message):
 if __name__ == "__main__":
     print("Бот запущен! Иерархия 9 рангов, Тикет-система и Ники (4+) активны.")
     bot.run_forever()
-   
